@@ -1,0 +1,198 @@
+---
+title: "Percent_Mining_Calculator"
+author: "Matthew Ross"
+date: "11/12/2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(sf) #Amazingly simple tidy GIS R package
+library(mapview) #Interactive mapping of sf objects
+library(mapedit) #Interactive editing of spatial data
+library(rayshader) #Lovely 3D rendering platform
+library(tidyverse) #Good 'ol tidyverse (dplyr, readr, more)
+library(elevatr) #R access to mapzen (dynamic downloading of DEMs)
+library(raster) # Name says it all, rasters in R
+library(whitebox)
+library(stars) # A bridge to the future of raster (spatiotemporal objects)
+library(rgl) 
+library(rfigshare)
+library(USAboundaries)
+library(tmap)
+knitr::opts_chunk$set(echo = TRUE)
+
+# Run once!
+#devtools::install_github("giswqs/whiteboxR")
+```
+
+
+In 2018 Andrew Pericack and others published a paper mapping the extent of 
+mountaintop mining activities in West Virginia, Virginia, Kentucky, and Tennessee.
+In this [paper](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0197758), we only do this analysis from an areal point of view. So if
+you wanted to know how much mining was upstream of any given point in the region
+we couldn't tell you. But using the amazing `whitebox` tools, we can use R
+to calculate the % mining of any river in the region and then extract that to
+any arbitrary point. 
+
+First we need to download the cumulative mining dataset that Andrew made which 
+is [here](https://figshare.com/s/1383008730d98258f96a) and an elevation dataset
+which we will use to calculate watershed metrics.
+
+# Data acquisition and organization
+
+## Cumulative mining from Pericack et al., 2018
+```{r}
+
+#Create a data repo if one doesn't exist.
+if(all(grepl('data',list.files()))){
+  dir.create('data')
+} else{print('data folder already exists')}
+
+  
+
+#Download datasets with a check so it doesn't get downloaded twice
+
+
+cume_file <- 'data/cume.tif'
+
+if(file.exists(cume_file)){
+  print('file already downloaded')
+}else{
+  download.file('https://ndownloader.figshare.com/files/11429579?private_link=1383008730d98258f96a',destfile=cume_file,method='libcurl',mode='wb')
+  }
+
+
+```
+
+
+## Check out this raster
+
+It's huge so we will subset it to one county in WV and shrink it to 
+90m resolution from 30m
+
+```{r}
+
+cume <- raster('data/cume.tif')
+
+
+boone <- us_counties(resolution='high',states='WV') %>%
+  filter(name == 'Boone') %>%
+  st_transform(st_crs(cume))
+  
+
+cume_boone <- crop(cume,boone) %>%
+  aggregate(.,3)
+
+
+mapview(cume_boone)
+```
+
+
+## Download relevant elevation data
+
+Our watershed analyses will be based on elevation data which we will 
+get from elevatr
+
+```{r}
+elev <- get_elev_raster(cume_boone,z=10) %>%
+  crop(.,cume_boone) %>%
+  projectRaster(.,cume_boone)
+
+#Save this elev data for whitebox
+writeRaster(elev,'data/elev.tif',overwrite=T)
+
+#Create a raster with same extent as elev but where all values are set
+#to 1
+
+full <- setValues(elev,1) 
+empty <- setValues(elev,0)
+writeRaster(full,'data/full.tif',overwrite=T)
+writeRaster(empty,'data/empty.tif',overwrite=T)
+writeRaster(cume_boone,'data/cume_boone.tif',overwrite=T)
+
+```
+
+## Analyze DEM using whitebox
+
+Whitebox is an amazing tool with strong documentation [here](https://jblindsay.github.io/wbt_book/available_tools/hydrological_analysis.html)
+
+```{r}
+
+
+raw_file <- 'data/elev.tif'
+
+#Fill single cell pits (for hydrologic correctness)
+wbt_breach_single_cell_pits(raw_file,'data/breach1.tif')
+#Breach depressions (better option that pit filling according to whitebox docu
+#mentation) The flat_increment bit was tricky for me and needed to be tuned.
+wbt_breach_depressions('data/breach1.tif',
+                             'data/breached.tif',
+                             flat_increment=.1)
+
+#D8 pointer (what is a pointer? a flow direction grid)
+wbt_d8_pointer('data/breached.tif','data/d8_pntr.tif')
+
+#D8 flow accumulation (raster cells fully drain in 1 of 8 directions)
+wbt_d8_flow_accumulation('data/breached.tif',
+                     'data/d8_flow.tif',
+                     out_type='catchment area',
+                     log=F)
+
+
+wbt_d8_mass_flux(dem='data/breached.tif',
+                 loading='data/cume_boone.tif',
+                 efficiency='data/full.tif',
+                 absorption='data/empty.tif',
+                 output='data/mine_cume.tif')
+
+
+
+# Dinf flow accumulation (Flow can be partially partitioned to many cells )
+wbt_d_inf_flow_accumulation('data/breached.tif',
+                        'data/d_inf_flow.tif',
+                        out_type='catchment area',
+                        log=T)
+
+
+
+#Extract the stream network with a threshold of 11
+#This threshold should be adjusted
+#wbt_extract_streams('data/d8_flow.tif',output='data/streams.tif',threshold=11)
+
+```
+
+
+## Watershed plots
+
+First let's just look at the flow accumulation output
+
+```{r}
+d8 <- raster('data/d8_flow.tif')
+
+tm_shape(d8) + 
+  tm_raster(style='log10')
+
+```
+
+
+```{r}
+mcume <- raster('data/mine_cume.tif')*(90*90)
+
+tm_shape(mcume) + 
+  tm_raster()
+
+
+d_streams <- d8
+
+d_streams[d_streams < 10000] <- NA
+
+pmine <- mcume/d_streams*100
+pmine[pmine < 1] <- NA
+
+tm_shape(pmine)+
+  tm_raster(style='log10')
+
+```
+
